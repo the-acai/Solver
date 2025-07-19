@@ -3,9 +3,12 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 // For safely sharing progress between a million threads clawing at each other
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 // For timing the code
 use std::time::Instant;
 
@@ -45,11 +48,7 @@ struct Config {
 
 /// The actual computation
 /// TODO: replace with something useful
-fn compute_output(inputs: &[f64]) -> f64 {
-    let a = inputs[0];
-    let b = inputs[1];
-    let c = inputs[2];
-
+fn compute_output(a: f64, b: f64, c: f64) -> f64 {
     // Expensive math, turns electric bill into a CSV of numbers
     (a * b + c).sin().cos().sqrt().exp()
 }
@@ -84,50 +83,45 @@ fn main() {
             .unwrap(),
     );
     let pb = Arc::new(pb); // Share it like a hot potato
-    let pb_inc_mutex = Arc::new(Mutex::new(0u64)); // Shared counter so threads don't fistfight and kill eachother
+    let counter = Arc::new(AtomicU64::new(0));
 
-    // And now... the hell loop
-    let results: Vec<(f64, f64, f64, f64)> = a_vals
-        .par_iter() // Outer loop
-        .flat_map_iter(|&a| {
-            let b_vals = &b_vals;
-            let c_vals_cloned = c_vals.clone(); // cloning
-            let pb = Arc::clone(&pb);
-            let pb_inc_mutex = Arc::clone(&pb_inc_mutex);
+    let len_a = a_vals.len();
+    let len_b = b_vals.len();
+    let len_c = c_vals.len();
 
-            b_vals.iter().flat_map(move |&b| {
-                let c_vals_inner = c_vals_cloned.clone(); // Another clone, Kill me
-                let pb = Arc::clone(&pb);
-                let pb_inc_mutex = Arc::clone(&pb_inc_mutex);
+    // And now... the hell loop, flattened into a single index
+    let results: Vec<(f64, f64, f64, f64)> = (0..len_a * len_b * len_c)
+        .into_par_iter()
+        .map(|idx| {
+            let c_idx = idx % len_c;
+            let b_idx = (idx / len_c) % len_b;
+            let a_idx = idx / (len_b * len_c);
 
-                // Final loop: welcome to inner-loop hell
-                c_vals_inner.into_iter().map(move |c| {
-                    let input = vec![a, b, c];
-                    let output = compute_output(&input); // Do the actual math
+            let a = a_vals[a_idx];
+            let b = b_vals[b_idx];
+            let c = c_vals[c_idx];
 
-                    // Update the progress bar every 1000 ops, because otherwise it lags like hell, might make this larger or match CPU threads
-                    let mut counter = pb_inc_mutex.lock().unwrap();
-                    *counter += 1;
-                    if *counter >= 1000 {
-                        pb.inc(*counter);
-                        *counter = 0;
-                    }
+            let output = compute_output(a, b, c); // Do the actual math
 
-                    (a, b, c, output) // Save this sweet combo, could be a possible solution but probably not
-                })
-            })
+            // Update the progress bar every 1000 ops
+            let prev = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if prev % 1000 == 0 {
+                pb.inc(1000);
+            }
+
+            (a, b, c, output)
         })
         .collect();
 
     // Last gasp of progress reporting
-    pb.inc(*pb_inc_mutex.lock().unwrap());
+    pb.inc(counter.load(Ordering::Relaxed) % 1000);
     pb.finish_with_message("Computation complete");
 
     // Save the results to a CSV, because they're still the king
-    let mut file = File::create(&config.output).expect("Couldn't create output file. Fuck.");
-    writeln!(file, "a,b,c,result").expect("Failed to write headers. Seriously?");
+    let mut writer = BufWriter::new(File::create(&config.output).expect("Couldn't create output file. Fuck."));
+    writeln!(writer, "a,b,c,result").expect("Failed to write headers. Seriously?");
     for (a, b, c, result) in results {
-        writeln!(file, "{},{},{},{}", a, b, c, result).expect("Couldn't write data. Goddammit.")
+        writeln!(writer, "{},{},{},{}", a, b, c, result).expect("Couldn't write data. Goddammit.");
     }
 
     // Celebrate that it didn't crash and burn if it even makes it this far
