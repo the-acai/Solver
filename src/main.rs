@@ -2,10 +2,9 @@
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use itertools::iproduct;
-use meval::Expr;
+use meval::{Context, Expr};
 use ordered_float::OrderedFloat;
-use rayon::iter::{ParallelBridge, ParallelIterator};
+use rayon::prelude::*;
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
@@ -26,16 +25,22 @@ const PB_BATCH: u64 = 10_000;
 #[command(name = "Compute Optimizer")]
 struct Config {
     /// Minimum / maximum for parameter a
-    #[arg(long, default_value_t = -10.0)] min_a: f64,
-    #[arg(long, default_value_t =  10.0)] max_a: f64,
+    #[arg(long, default_value_t = -10.0)]
+    min_a: f64,
+    #[arg(long, default_value_t = 10.0)]
+    max_a: f64,
 
     /// Minimum / maximum for parameter b
-    #[arg(long, default_value_t = -10.0)] min_b: f64,
-    #[arg(long, default_value_t =  10.0)] max_b: f64,
+    #[arg(long, default_value_t = -10.0)]
+    min_b: f64,
+    #[arg(long, default_value_t = 10.0)]
+    max_b: f64,
 
     /// Minimum / maximum for parameter c
-    #[arg(long, default_value_t = -10.0)] min_c: f64,
-    #[arg(long, default_value_t =  10.0)] max_c: f64,
+    #[arg(long, default_value_t = -10.0)]
+    min_c: f64,
+    #[arg(long, default_value_t = 10.0)]
+    max_c: f64,
 
     /// Grid resolution per axis (total ops = steps³)
     #[arg(long, default_value_t = 100)]
@@ -59,13 +64,64 @@ struct Config {
     output: String,
 }
 
+/// Compute function variants
+#[derive(Clone)]
+enum ComputeFn {
+    Default(fn(f64, f64, f64) -> f64),
+    Expr(Arc<Expr>),
+}
+
+impl ComputeFn {
+    fn eval(&self, a: f64, b: f64, c: f64) -> f64 {
+        match self {
+            Self::Default(f) => f(a, b, c),
+            Self::Expr(expr) => expr
+                .eval_with_context(([("a", a), ("b", b), ("c", c)], Context::new()))
+                .expect("eval failed"),
+        }
+    }
+}
+
+fn default_compute(a: f64, b: f64, c: f64) -> f64 {
+    (a * b + c).sin().cos().sqrt().exp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_linspace() {
+        let vals = linspace(0.0, 1.0, 5);
+        assert_eq!(vals, vec![0.0, 0.25, 0.5, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn test_compute_default() {
+        let cf = ComputeFn::Default(default_compute as fn(f64, f64, f64) -> f64);
+        let direct = default_compute(1.0, 2.0, 3.0);
+        assert!((cf.eval(1.0, 2.0, 3.0) - direct).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_expr() {
+        let expr: Expr = "a + b + c".parse().unwrap();
+        let cf = ComputeFn::Expr(Arc::new(expr));
+        assert_eq!(cf.eval(1.0, 2.0, 3.0), 6.0);
+    }
+}
+
 /// NumPy‑style linspace (inclusive)
 fn linspace(min: f64, max: f64, steps: usize) -> Vec<f64> {
     if steps <= 1 {
         vec![min]
     } else {
         let step = (max - min) / (steps - 1) as f64;
-        (0..steps).map(|i| min + i as f64 * step).collect()
+        let mut vals = Vec::with_capacity(steps);
+        for i in 0..steps {
+            vals.push(min + i as f64 * step);
+        }
+        vals
     }
 }
 
@@ -87,16 +143,15 @@ fn main() -> Result<()> {
     let start = Instant::now();
 
     /* -------------------- set up compute function ------------------------ */
-    let compute_fn: Arc<dyn Fn(f64, f64, f64) -> f64 + Send + Sync> = if let Some(expr_str) = &cfg.expr {
+    let compute_fn = if let Some(expr_str) = &cfg.expr {
         let expr: Expr = expr_str
             .parse()
             .map_err(|e| anyhow!("Expression parse error: {e}"))?;
-        let func = expr
-            .bind3("a", "b", "c")
-            .map_err(|e| anyhow!("Binding error: {e}"))?;
-        Arc::new(move |a, b, c| func(a, b, c))
+        Arc::new(ComputeFn::Expr(Arc::new(expr)))
     } else {
-        Arc::new(|a: f64, b: f64, c: f64| (a * b + c).sin().cos().sqrt().exp())
+        Arc::new(ComputeFn::Default(
+            default_compute as fn(f64, f64, f64) -> f64,
+        ))
     };
 
     /* ------------------------- build ranges ----------------------------- */
@@ -104,7 +159,10 @@ fn main() -> Result<()> {
     let b_vals = linspace(cfg.min_b, cfg.max_b, cfg.steps);
     let c_vals = linspace(cfg.min_c, cfg.max_c, cfg.steps);
 
-    let total = (a_vals.len() * b_vals.len() * c_vals.len()) as u64;
+    let na = a_vals.len();
+    let nb = b_vals.len();
+    let nc = c_vals.len();
+    let total = (na * nb * nc) as u64;
     if !cfg.force && total > 10_000_000 {
         confirm_large_run(total)?;
     }
@@ -123,48 +181,67 @@ fn main() -> Result<()> {
     /* ----------------------- main workload ------------------------------ */
     if let Some(top_n) = cfg.top {
         /* -------- Top‑N mode (memory‑bounded) --------------------------- */
-        type Item = Reverse<(OrderedFloat<f64>, f64, f64, f64)>; // min‑heap
-        let heap = iproduct!(
-            a_vals.iter().cloned(),
-            b_vals.iter().cloned(),
-            c_vals.iter().cloned()
-        )
-        .par_bridge()
-        .fold(
-            || BinaryHeap::<Item>::new(),
-            |mut heap, (a, b, c)| {
-                let res = (compute_fn)(a, b, c);
+        type Item = Reverse<(
+            OrderedFloat<f64>,
+            OrderedFloat<f64>,
+            OrderedFloat<f64>,
+            OrderedFloat<f64>,
+        )>; // min‑heap
+        let heap = (0..na * nb * nc)
+            .into_par_iter()
+            .fold(
+                || BinaryHeap::<Item>::new(),
+                |mut heap, idx| {
+                    let ia = idx % na;
+                    let ib = (idx / na) % nb;
+                    let ic = idx / (na * nb);
+                    let a = a_vals[ia];
+                    let b = b_vals[ib];
+                    let c = c_vals[ic];
+                    let res = compute_fn.eval(a, b, c);
 
-                // progress
-                let prev = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if prev % PB_BATCH == 0 {
-                    pb.inc(PB_BATCH);
-                }
-
-                heap.push(Reverse((OrderedFloat(res), a, b, c)));
-                if heap.len() > top_n {
-                    heap.pop(); // discard lowest
-                }
-                heap
-            },
-        )
-        .reduce(
-            || BinaryHeap::<Item>::new(),
-            |mut h1, h2| {
-                for item in h2 {
-                    h1.push(item);
-                    if h1.len() > top_n {
-                        h1.pop();
+                    // progress
+                    let prev = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if prev % PB_BATCH == 0 {
+                        pb.inc(PB_BATCH);
                     }
-                }
-                h1
-            },
-        );
+
+                    heap.push(Reverse((
+                        OrderedFloat(res),
+                        OrderedFloat(a),
+                        OrderedFloat(b),
+                        OrderedFloat(c),
+                    )));
+                    if heap.len() > top_n {
+                        heap.pop(); // discard lowest
+                    }
+                    heap
+                },
+            )
+            .reduce(
+                || BinaryHeap::<Item>::new(),
+                |mut h1, h2| {
+                    for item in h2 {
+                        h1.push(item);
+                        if h1.len() > top_n {
+                            h1.pop();
+                        }
+                    }
+                    h1
+                },
+            );
 
         let mut results: Vec<_> = heap
             .into_sorted_vec() // ascending
             .into_iter()
-            .map(|Reverse((score, a, b, c))| (a, b, c, score.into_inner()))
+            .map(|Reverse((score, a, b, c))| {
+                (
+                    a.into_inner(),
+                    b.into_inner(),
+                    c.into_inner(),
+                    score.into_inner(),
+                )
+            })
             .collect();
         results.reverse(); // descending
 
@@ -191,8 +268,7 @@ fn main() -> Result<()> {
         // Writer thread
         let output_path = cfg.output.clone();
         let writer_handle = std::thread::spawn(move || -> Result<()> {
-            let mut wtr =
-                csv::Writer::from_writer(BufWriter::new(File::create(output_path)?));
+            let mut wtr = csv::Writer::from_writer(BufWriter::new(File::create(output_path)?));
             wtr.write_record(&["a", "b", "c", "result"])?;
             for (a, b, c, r) in rx {
                 wtr.serialize((a, b, c, r))?;
@@ -202,14 +278,14 @@ fn main() -> Result<()> {
         });
 
         // Compute threads
-        iproduct!(
-            a_vals.iter().cloned(),
-            b_vals.iter().cloned(),
-            c_vals.iter().cloned()
-        )
-        .par_bridge()
-        .for_each(|(a, b, c)| {
-            let res = (compute_fn)(a, b, c);
+        (0..na * nb * nc).into_par_iter().for_each(|idx| {
+            let ia = idx % na;
+            let ib = (idx / na) % nb;
+            let ic = idx / (na * nb);
+            let a = a_vals[ia];
+            let b = b_vals[ib];
+            let c = c_vals[ic];
+            let res = compute_fn.eval(a, b, c);
             tx.send((a, b, c, res)).expect("writer thread gone");
 
             let prev = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -219,9 +295,7 @@ fn main() -> Result<()> {
         });
 
         drop(tx); // close channel
-        writer_handle
-            .join()
-            .expect("writer thread panicked")?; // propagate error
+        writer_handle.join().expect("writer thread panicked")?; // propagate error
 
         // flush remaining progress ticks & finish bar
         let rem = counter.load(Ordering::Relaxed) % PB_BATCH;
